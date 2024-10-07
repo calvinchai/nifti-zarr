@@ -1,33 +1,24 @@
+import argparse
 import io
 import sys
+import warnings
+
+import dask.array
+import numpy as np
 import zarr.hierarchy
 import zarr.storage
-import numpy as np
-import dask.array
-import argparse
-from nibabel import (Nifti1Image, Nifti1Header, Nifti2Image, Nifti2Header,
-                     save, load)
-from ._header import HEADERTYPE1, HEADERTYPE2
+from nibabel import (save, load)
+from nibabel.nifti1 import Nifti1Extensions
+
+from ._header import bin2nii, get_nibabel_klass, SYS_BYTEORDER
 
 # If fsspec available, use fsspec
 try:
     import fsspec
+
     open = fsspec.open
 except (ImportError, ModuleNotFoundError):
     fsspec = None
-
-
-def bin2nii(buffer):
-    header = np.frombuffer(buffer, dtype=HEADERTYPE1, count=1)[0]
-    if header['magic'].decode() not in ('ni1', 'n+1', 'nz1'):
-        header = header.newbyteorder()
-    if header['magic'].decode() not in ('ni1', 'n+1', 'nz1'):
-        header = np.frombuffer(buffer, dtype=HEADERTYPE2, count=1)[0]
-        if header['magic'].decode() not in ('ni2', 'n+2', 'nz2'):
-            header = header.newbyteorder()
-        if header['magic'].decode() not in ('ni2', 'n+2', 'nz2'):
-            raise ValueError('Is this a nifti header?')
-    return header
 
 
 def zarr2nii(inp, out=None, level=0):
@@ -40,7 +31,7 @@ def zarr2nii(inp, out=None, level=0):
         Output zarr object
     out : path or file_like, optional
         Path to output file. If not provided, do not write a file.
-    levels : int
+    level : int
         Pyramid level to extract
 
     Returns
@@ -56,21 +47,17 @@ def zarr2nii(inp, out=None, level=0):
             else:
                 inp = zarr.storage.DirectoryStore(inp)
         inp = zarr.group(store=inp)
+    # check nifti info present in zarr archive
+    if 'nifti' not in inp:
+        raise KeyError("NifTi data not present in zarr archive. Is this a nifti.zarr file?")
 
     # read binary header
     header = bin2nii(np.asarray(inp['nifti']).tobytes())
 
-    # create nibabel header (useful to convert quat 2 affine, etc)
-    magic = header['magic'].decode()
-    if magic[-1] == '1':
-        NiftiHeader = Nifti1Header
-        NiftiImage = Nifti1Image
-    else:
-        NiftiHeader = Nifti2Header
-        NiftiImage = Nifti2Image
+    NiftiHeader, NiftiImage = get_nibabel_klass(header)
     niiheader = NiftiHeader.from_fileobj(io.BytesIO(header.tobytes()),
                                          check=False)
-
+    byte_swapped = niiheader.endianness != SYS_BYTEORDER
     # create affine at current resolution
     if level != 0:
         qform, qcode = niiheader.get_qform(coded=True)
@@ -96,18 +83,33 @@ def zarr2nii(inp, out=None, level=0):
 
     # reorder/reshape array as needed
     array = dask.array.from_zarr(inp[f'{level}'])
+
+    actual_axis_order = tuple(axis['name'] for axis in inp.attrs['multiscales'][0]['axes'])
     if array.ndim == 5:
         array = array.transpose([4, 3, 2, 0, 1])
+        assert actual_axis_order == ('t', 'c', 'z', 'y', 'x')
     elif array.ndim == 4:
-        array = array.transpose([3, 2, 1, 0])[..., None, :]
+        array = array.transpose([3, 2, 1, 0])
+        assert actual_axis_order == ('t', 'z', 'y', 'x')
     elif array.ndim == 3:
         array = array.transpose([2, 1, 0])
-    while array.ndim > header['dim'][0].item():
-        assert array.shape[-1] == 1
-        array = array[..., 0]
+        assert actual_axis_order == ('z', 'y', 'x')
+    elif array.ndim == 2:
+        array = array.transpose([1, 0])
+        assert actual_axis_order == ('y', 'x')
 
     # create nibabel image
     img = NiftiImage(array, None, niiheader)
+
+    # load extensions following the header binary data if present
+    extension_size = len(inp['nifti']) - header['sizeof_hdr']
+    if extension_size > 0:
+        try:
+            file_obj = io.BytesIO(np.asarray(inp['nifti']).tobytes()[header['sizeof_hdr']:])
+            img.header.extensions = Nifti1Extensions.from_fileobj(file_obj, extension_size, byte_swapped)
+
+        except Exception:
+            warnings.warn("Failed to load extensions")
 
     if out is not None:
         if hasattr(out, 'read'):
