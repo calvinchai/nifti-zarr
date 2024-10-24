@@ -1,32 +1,33 @@
-import sys
+import argparse
+import io
 import json
 import math
+import re
+import sys
+
+import numcodecs
+import numpy as np
 import zarr.hierarchy
 import zarr.storage
-import numpy as np
-import numcodecs
-import argparse
-from skimage.transform import pyramid_gaussian, pyramid_laplacian
-from ome_zarr.writer import write_multiscale
 from nibabel import Nifti1Image, load
-from ._header import (
-    UNITS, DTYPES, INTENTS, INTENTS_P, SLICEORDERS, XFORMS,
-    HEADERTYPE1, HEADERTYPE2,
-)
+from ome_zarr.writer import write_multiscale
+from skimage.transform import pyramid_gaussian, pyramid_laplacian
 
+from ._header import (
+    UNITS, DTYPES, INTENTS, INTENTS_P, SLICEORDERS, XFORMS, bin2nii, get_magic_string, SYS_BYTEORDER, JNIFTI_ZARR,
+    SYS_BYTEORDER_SWAPPED
+)
 
 # If fsspec available, use fsspec
 try:
     import fsspec
+
     open = fsspec.open
 except (ImportError, ModuleNotFoundError):
     fsspec = None
 
 
-SYS_BYTEORDER = '<' if sys.byteorder == 'little' else '>'
-
-
-def nii2json(header):
+def nii2json(header, extensions=False):
     """
     Convert a nifti header to JSON
 
@@ -34,84 +35,84 @@ def nii2json(header):
     ----------
     header : np.array[HEADERTYPE1 or HEADERTYPE2]
         Nifti header in binary form
-
+    extensions: bool, optional
+        If extensions present in this nifti file
     Returns
     -------
     header : dict
         Nifti header in JSON form
+
     """
-    # use nz1/nz2 instead of n+1/n+2
     header = header.copy()
-    magic = header["magic"].tobytes().decode()
-    magic = magic[:1] + 'z' + magic[2:]
-    header['magic'] = magic
 
     ndim = header["dim"][0].item()
     intent_code = INTENTS[header["intent_code"].item()]
-    jsonheader = {
-        "magic": header["magic"].tobytes().decode(),
-        "dim": header["dim"][1:1+ndim].tolist(),
-        "pixdim": header["pixdim"][1:1+ndim].tolist(),
-        "units": {
-            "space": UNITS[(header["xyzt_units"] & 0x07).item()],
-            "time": UNITS[(header["xyzt_units"] & 0x38).item()],
-        },
-        "datatype": DTYPES[header["datatype"].item()],
-        "dim_info": {
-            "freq": (header["dim_info"] & 0x03).item(),
-            "phase": ((header["dim_info"] >> 2) & 0x03).item(),
-            "slice": ((header["dim_info"] >> 4) & 0x03).item(),
-        },
-        "intent": {
-            "code": intent_code,
-            "name": header["intent_name"].tobytes().decode(),
-            "p": header["intent_p"][:INTENTS_P[intent_code]].tolist(),
-        },
-        "scl": {
-            "slope": header["scl_slope"].item(),
-            "inter": header["scl_inter"].item(),
-        },
-        "slice": {
-            "code": SLICEORDERS[header["slice_code"].item()],
-            "start": header["slice_start"].item(),
-            "end": header["slice_end"].item(),
-            "duration": header["slice_duration"].item(),
-        },
-        "cal": {
-            "min": header["cal_min"].item(),
-            "max": header["cal_max"].item(),
-        },
-        "toffset": header["toffset"].item(),
-        "descrip": header["descrip"].tobytes().decode(),
-        "aux_file": header["aux_file"].tobytes().decode(),
-        "qform": {
-            "intent": XFORMS[header["qform_code"].item()],
-            "quatern": header["quatern"].tolist(),
-            "offset": header["qoffset"].tolist(),
-            "fac": header["pixdim"][0].item(),
-        },
-        "sform": {
-            "intent": XFORMS[header["sform_code"].item()],
-            "affine": header["sform"].tolist(),
-        },
-    }
-    if not math.isfinite(jsonheader["scl"]["slope"]):
-        jsonheader["scl"]["slope"] = 0.0
-    if not math.isfinite(jsonheader["scl"]["inter"]):
-        jsonheader["scl"]["inter"] = 0.0
 
-    # Fix data type
-    byteorder = header['sizeof_hdr'].dtype.byteorder
-    if byteorder == '=':
-        byteorder = SYS_BYTEORDER
-    if isinstance(jsonheader["datatype"], tuple):
-        jsonheader["datatype"] = [
-            [field, '|' + dtype] for field, dtype in jsonheader["datatype"]
-        ]
-    elif jsonheader["datatype"].endswith('1'):
-        jsonheader["datatype"] = '|' + jsonheader["datatype"]
-    else:
-        jsonheader["datatype"] = byteorder + jsonheader["datatype"]
+    intent_param = header["intent_p"][:INTENTS_P[intent_code]].tolist()
+    quatern = header["quatern"].tolist()
+    qoffset = header["qoffset"].tolist()
+
+    jsonheader = {
+        # Strip control characters
+        "NIIFormat": get_magic_string(header),
+        "Dim": header["dim"][1:1 + ndim].tolist(),
+        "VoxelSize": header["pixdim"][1:1 + ndim].tolist(),
+        "Unit": {
+            "L": UNITS[(header["xyzt_units"] & 0x07).item()],
+            "T": UNITS[(header["xyzt_units"] & 0x38).item()],
+        },
+        "DataType": DTYPES[header["datatype"].item()],
+        "DimInfo": {
+            "Freq": (header["dim_info"] & 0x03).item(),
+            "Phase": ((header["dim_info"] >> 2) & 0x03).item(),
+            "Slice": ((header["dim_info"] >> 4) & 0x03).item(),
+        },
+        "Intent": intent_code,
+        "Param1": intent_param[0] if len(intent_param) > 0 else None,
+        "Param2": intent_param[1] if len(intent_param) > 1 else None,
+        "Param3": intent_param[2] if len(intent_param) > 2 else None,
+        "Name": header["intent_name"].tobytes().decode(),
+        "ScaleSlope": header["scl_slope"].item(),
+        "ScaleOffset": header["scl_inter"].item(),
+        "FirstSliceID": header["slice_start"].item(),
+        "LastSliceID": header["slice_end"].item(),
+        "SliceType": SLICEORDERS[header["slice_code"].item()],
+        "SliceTime": header["slice_duration"].item(),
+        "MinIntensity": header["cal_min"].item(),
+        "MaxIntensity": header["cal_max"].item(),
+        "TimeOffset": header["toffset"].item(),
+        "Description": header["descrip"].tobytes().decode(),
+        "AuxFile": header["aux_file"].tobytes().decode(),
+        "QForm": XFORMS[header["qform_code"].item()],
+        "Quatern": {
+            "b": quatern[0],
+            "c": quatern[1],
+            "d": quatern[2],
+        },
+        "QuaternOffset": {
+            "x": qoffset[0],
+            "y": qoffset[1],
+            "z": qoffset[2],
+        },
+        # TODO: change this after JNIfTI changed
+        "Orientation": {
+            "x": "r" if header["pixdim"][0].item() == 0 else "l",
+            "y": "a",
+            "z": "s",
+        },
+        "SForm": XFORMS[header["sform_code"].item()],
+        "Affine": header["sform"].tolist(),
+        "NIFTIExtension": [1 if extensions else 0] + [0, 0, 0],
+    }
+    if not math.isfinite(jsonheader["ScaleSlope"]):
+        jsonheader["ScaleSlope"] = 0.0
+    if not math.isfinite(jsonheader["ScaleOffset"]):
+        jsonheader["ScaleOffset"] = 0.0
+
+    # Remove control characters
+    for k, v in jsonheader.items():
+        if isinstance(v, str):
+            jsonheader[k] = re.sub(r'[\n\r\t\00]*', '', v)
 
     # Check that the dictionary is serializable
     json.dumps(jsonheader)
@@ -146,7 +147,7 @@ def _make_pyramid3d(
 
     batch, nxyz = data3d.shape[:-3], data3d.shape[-3:]
     data3d = data3d.reshape((-1, *nxyz))
-    max_layer = nb_levels - 1 if nb_levels > 0 else -1
+    max_layer = nb_levels - 1
 
     def pyramid_values(x):
         return pyramid_fn(x, max_layer, 2, preserve_range=True,
@@ -212,7 +213,8 @@ def nii2zarr(inp, out, *,
         Chunk size of the time dimension. If 0, combine all timepoints
         in a single chunk.
     nb_levels : int
-        Number of levels in the pyramid. Default: all possible levels.
+        Number of levels in the pyramid. If -1, make all possible levels until the level can be fit into one chunk.
+        Default: -1
     method : {'gaussian', 'laplacian'}
         Method used to compute the pyramid.
     label : bool
@@ -249,15 +251,9 @@ def nii2zarr(inp, out, *,
     if no_time and len(inp.shape) > 3:
         inp = Nifti1Image(inp.dataobj[:, :, :, None], inp.affine, inp.header)
 
-    # Parse nifti header
-    v = int(inp.header.structarr['magic'].tobytes().decode()[2])
-    header = np.frombuffer(inp.header.structarr.tobytes(), count=1,
-                           dtype=HEADERTYPE1 if v == 1 else HEADERTYPE2)[0]
-    if header['magic'].decode() not in ('ni1', 'n+1', 'ni2', 'n+2'):
-        swappedheader = header.newbyteorder()
-    else:
-        swappedheader = header
-    jsonheader = nii2json(swappedheader)
+    header = bin2nii(inp.header.structarr.tobytes())
+    byteorder_swapped = inp.header.endianness != SYS_BYTEORDER
+    jsonheader = nii2json(header, len(inp.header.extensions) != 0)
 
     data = np.asarray(inp.dataobj)
 
@@ -301,12 +297,34 @@ def nii2zarr(inp, out, *,
 
     # Compute image pyramid
     if label is None:
-        label = jsonheader["intent"]["code"] in ("LABEL", "NEURONAMES")
+        label = jsonheader['Intent'] in ("label", "neuronames")
     pyramid_fn = pyramid_gaussian if method[0] == 'g' else pyramid_laplacian
+
+    # if chunk is a list, we use the first tuple, otherwise the logic might be too complicated
+    chunksize = np.array((chunk,) * 3 if isinstance(chunk, int) else chunk[0])
+    nxyz = np.array(data.shape[-3:])
+
+    default_layers = int(np.ceil(np.log2(np.max(nxyz / chunksize)))) + 1
+    default_layers = max(default_layers, 1)
+    nb_levels = default_layers if nb_levels == -1 else nb_levels
+
     data = list(_make_pyramid3d(data, nb_levels, pyramid_fn, label,
                                 no_pyramid_axis))
-    nb_levels = len(data)
+
     shapes = [d.shape[-3:] for d in data]
+
+    # Fix data type
+    # If nifti was swapped when loading it, we want to swapped it back to make it as same as before
+    byteorder = SYS_BYTEORDER_SWAPPED if byteorder_swapped else SYS_BYTEORDER
+    data_type = JNIFTI_ZARR[jsonheader['DataType']]
+    if isinstance(data_type, tuple):
+        data_type = [
+            (field, '|' + dtype) for field, dtype in data_type
+        ]
+    elif data_type.endswith('1'):
+        data_type = '|' + data_type
+    else:
+        data_type = byteorder + data_type
 
     # Prepare array metadata at each level
     compressor = _make_compressor(compressor, **compressor_options)
@@ -320,7 +338,7 @@ def nii2zarr(inp, out, *,
         'chunks': c,
         'dimension_separator': r'/',
         'order': 'F',
-        'dtype': jsonheader['datatype'],
+        'dtype': data_type,
         'fill_value': fill_value,
         'compressor': compressor,
     } for c in chunk]
@@ -333,12 +351,22 @@ def nii2zarr(inp, out, *,
     )
 
     # Write nifti header (binary)
-    binheader = np.frombuffer(header.tobytes(), dtype='u1')
+    bin_data = [np.frombuffer(header.tobytes(), dtype='u1')]
+
+    if inp.header.extensions:
+        extension_stream = io.BytesIO()
+        inp.header.extensions.write_to(extension_stream,
+                                       byteswap=byteorder_swapped)
+        bin_data.append(np.frombuffer(extension_stream.getvalue(), dtype=np.uint8))
+
+    # Concatenate the final binary data
+    bin_data = np.concatenate(bin_data)
+
     out.create_dataset(
         'nifti',
-        data=binheader,
-        shape=[len(binheader)],
-        chunks=len(binheader),
+        data=bin_data,
+        shape=[len(bin_data)],
+        chunks=len(bin_data),
         dtype='u1',
         compressor=None,
         fill_value=None,
@@ -359,17 +387,17 @@ def nii2zarr(inp, out, *,
         {
             "name": "z",
             "type": "space",
-            "unit": jsonheader["units"]["space"],
+            "unit": JNIFTI_ZARR[jsonheader["Unit"]["L"]],
         },
         {
             "name": "y",
             "type": "space",
-            "unit": jsonheader["units"]["space"],
+            "unit": JNIFTI_ZARR[jsonheader["Unit"]["L"]],
         },
         {
             "name": "x",
             "type": "space",
-            "unit": jsonheader["units"]["space"],
+            "unit": JNIFTI_ZARR[jsonheader["Unit"]["L"]],
         }
     ]
     if nbatch >= 2:
@@ -381,7 +409,7 @@ def nii2zarr(inp, out, *,
         multiscales[0]["axes"].insert(0, {
             "name": "t",
             "type": "time",
-            "unit": jsonheader["units"]["time"],
+            "unit": JNIFTI_ZARR[jsonheader["Unit"]["T"]],
         })
     for n, level in enumerate(multiscales[0]["datasets"]):
         # skimage pyramid_gaussian/pyramid_laplace use
@@ -389,16 +417,16 @@ def nii2zarr(inp, out, *,
         # so the effective scaling is the shape ratio, and there is
         # a half voxel shift wrt to the "center of first voxel" frame
         level["coordinateTransformations"][0]["scale"] = [1.0] * nbatch + [
-            (shapes[0][0]/shapes[n][0])*jsonheader["pixdim"][2],
-            (shapes[0][1]/shapes[n][1])*jsonheader["pixdim"][1],
-            (shapes[0][2]/shapes[n][2])*jsonheader["pixdim"][0],
+            (shapes[0][0] / shapes[n][0]) * jsonheader["VoxelSize"][2],
+            (shapes[0][1] / shapes[n][1]) * jsonheader["VoxelSize"][1],
+            (shapes[0][2] / shapes[n][2]) * jsonheader["VoxelSize"][0],
         ]
         level["coordinateTransformations"].append({
             "type": "translation",
             "translation": [0.0] * nbatch + [
-                (shapes[0][0]/shapes[n][0] - 1)*jsonheader["pixdim"][2]*0.5,
-                (shapes[0][1]/shapes[n][1] - 1)*jsonheader["pixdim"][1]*0.5,
-                (shapes[0][2]/shapes[n][2] - 1)*jsonheader["pixdim"][0]*0.5,
+                (shapes[0][0] / shapes[n][0] - 1) * jsonheader["VoxelSize"][2] * 0.5,
+                (shapes[0][1] / shapes[n][1] - 1) * jsonheader["VoxelSize"][1] * 0.5,
+                (shapes[0][2] / shapes[n][2] - 1) * jsonheader["VoxelSize"][0] * 0.5,
             ]
         })
     multiscales[0]["coordinateTransformations"] = [
@@ -412,7 +440,7 @@ def nii2zarr(inp, out, *,
             0, 1.0)
     if nbatch >= 1:
         multiscales[0]["coordinateTransformations"][0]['scale'].insert(
-            0, jsonheader["pixdim"][3] or 1.0)
+            0, jsonheader["VoxelSize"][3] or 1.0)
 
     out.attrs["multiscales"] = multiscales
 
@@ -430,14 +458,14 @@ def cli(args=None):
     parser.add_argument(
         '--unchunk-channels', action='store_true',
         help='Save all chanels in a single chunk. '
-        'Unchunk if you want to display all channels as a single RGB '
-        'layer in neuroglancer. Chunked by default, unless datatype is RGB.'
+             'Unchunk if you want to display all channels as a single RGB '
+             'layer in neuroglancer. Chunked by default, unless datatype is RGB.'
     )
     parser.add_argument(
         '--unchunk-time', action='store_true',
         help='Save all timepoints in a single chunk.'
-        'Unchunk if you want to display all timepoints as a single RGB '
-        'layer in neuroglancer. Chunked by default. '
+             'Unchunk if you want to display all timepoints as a single RGB '
+             'layer in neuroglancer. Chunked by default. '
     )
     parser.add_argument(
         '--levels', type=int, default=-1,
@@ -458,7 +486,7 @@ def cli(args=None):
         '--no-label', action='store_false', dest='label',
         help='Not a segmentation volume')
     parser.add_argument(
-        '--no-time', action='store_true',  help='No time dimension')
+        '--no-time', action='store_true', help='No time dimension')
     parser.add_argument(
         '--no-pyramid-axis', choices=('x', 'y', 'z'),
         help='Thick slice axis that should not be downsampled'
